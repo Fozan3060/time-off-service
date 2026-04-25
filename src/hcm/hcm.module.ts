@@ -1,9 +1,13 @@
 import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { ReconciliationModule } from '../reconciliation/reconciliation.module';
+import { HcmWebhookController } from './hcm-webhook.controller';
 import { HcmClient } from './hcm-client';
 import { HcmClientConfig } from './hcm.types';
 
 @Module({
+  imports: [ReconciliationModule],
+  controllers: [HcmWebhookController],
   providers: [
     {
       provide: HcmClient,
