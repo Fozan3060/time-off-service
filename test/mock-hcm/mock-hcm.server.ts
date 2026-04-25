@@ -1,5 +1,4 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
-import express, { Express, Request, Response } from 'express';
+import express, { Express, Response } from 'express';
 import { Server } from 'http';
 
 export interface DeductionRecord {

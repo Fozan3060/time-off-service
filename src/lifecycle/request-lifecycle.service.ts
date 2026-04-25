@@ -3,12 +3,21 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
   UnprocessableEntityException,
 } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { BalanceService } from '../balances/balance.service';
 import { MutexRegistry } from '../concurrency/mutex-registry';
+import { HcmClient } from '../hcm/hcm-client';
+import {
+  HcmBusinessError,
+  HcmTransientError,
+  HcmVerificationError,
+} from '../hcm/hcm.errors';
+import { LedgerEventType } from '../ledger/ledger-event-type.enum';
+import { LedgerService } from '../ledger/ledger.service';
 import { RequestStatus } from '../requests/request-status.enum';
 import { RequestsService } from '../requests/requests.service';
 import { TimeOffRequest } from '../requests/time-off-request.entity';
@@ -26,11 +35,15 @@ export interface SubmitRequestInput {
 
 @Injectable()
 export class RequestLifecycleService {
+  private readonly logger = new Logger(RequestLifecycleService.name);
+
   constructor(
     private readonly requests: RequestsService,
     private readonly balances: BalanceService,
+    private readonly ledger: LedgerService,
     private readonly stateMachine: StateMachine,
     private readonly mutex: MutexRegistry,
+    private readonly hcm: HcmClient,
   ) {}
 
   async submit(input: SubmitRequestInput): Promise<TimeOffRequest> {
@@ -88,11 +101,40 @@ export class RequestLifecycleService {
     requestId: string,
     managerId: string,
   ): Promise<TimeOffRequest> {
-    return this.applyManagerDecision(
-      requestId,
-      managerId,
-      LifecycleEvent.APPROVE,
-    );
+    const req = await this.requests.findById(requestId);
+    if (!req) throw new NotFoundException('Request not found');
+    if (req.employeeId === managerId) {
+      throw new ForbiddenException(
+        'A manager cannot act on their own time-off request.',
+      );
+    }
+
+    const key = this.mutex.keyFor(req.employeeId, req.locationId);
+
+    // Phase 1: PENDING_APPROVAL -> APPROVED_SYNCING (under mutex), assign HCM key.
+    const approved = await this.mutex.runExclusive(key, async () => {
+      const fresh = await this.requests.findById(requestId);
+      if (!fresh) throw new NotFoundException('Request not found');
+
+      const transition = this.stateMachine.validate(
+        fresh.status,
+        LifecycleEvent.APPROVE,
+      );
+      if (!transition.ok) {
+        throw new ConflictException({
+          code: 'INVALID_TRANSITION',
+          message: transition.reason,
+        });
+      }
+
+      fresh.status = transition.nextState;
+      fresh.managerId = managerId;
+      fresh.hcmIdempotencyKey = `req-${fresh.id}`;
+      return this.requests.save(fresh);
+    });
+
+    // Phase 2: HCM call (no mutex held).
+    return this.syncToHcm(approved);
   }
 
   async reject(
@@ -100,18 +142,38 @@ export class RequestLifecycleService {
     managerId: string,
     reason: string | null = null,
   ): Promise<TimeOffRequest> {
-    return this.applyManagerDecision(
-      requestId,
-      managerId,
-      LifecycleEvent.REJECT,
-      reason,
-    );
+    const req = await this.requests.findById(requestId);
+    if (!req) throw new NotFoundException('Request not found');
+    if (req.employeeId === managerId) {
+      throw new ForbiddenException(
+        'A manager cannot act on their own time-off request.',
+      );
+    }
+
+    const key = this.mutex.keyFor(req.employeeId, req.locationId);
+    return this.mutex.runExclusive(key, async () => {
+      const fresh = await this.requests.findById(requestId);
+      if (!fresh) throw new NotFoundException('Request not found');
+
+      const transition = this.stateMachine.validate(
+        fresh.status,
+        LifecycleEvent.REJECT,
+      );
+      if (!transition.ok) {
+        throw new ConflictException({
+          code: 'INVALID_TRANSITION',
+          message: transition.reason,
+        });
+      }
+
+      fresh.status = transition.nextState;
+      fresh.managerId = managerId;
+      fresh.rejectionReason = reason;
+      return this.requests.save(fresh);
+    });
   }
 
-  async cancel(
-    requestId: string,
-    actorId: string,
-  ): Promise<TimeOffRequest> {
+  async cancel(requestId: string, actorId: string): Promise<TimeOffRequest> {
     const req = await this.requests.findById(requestId);
     if (!req) throw new NotFoundException('Request not found');
     if (req.employeeId !== actorId) {
@@ -122,6 +184,10 @@ export class RequestLifecycleService {
         code: 'CANCEL_AFTER_START',
         message: 'Cannot cancel a request whose leave has already started.',
       });
+    }
+
+    if (req.status === RequestStatus.SYNCED) {
+      return this.cancelSynced(req);
     }
 
     const key = this.mutex.keyFor(req.employeeId, req.locationId);
@@ -140,45 +206,56 @@ export class RequestLifecycleService {
         });
       }
 
-      // Note: cancellation after HCM sync requires a compensating HCM call.
-      // That is handled by the HCM integration branch; for now this path
-      // only supports cancelling from non-synced states.
-      if (fresh.status === RequestStatus.SYNCED) {
-        throw new ConflictException({
-          code: 'COMPENSATION_NOT_IMPLEMENTED',
-          message:
-            'Cancellation of a synced request requires HCM compensation. ' +
-            'This flow is implemented in a follow-up branch.',
-        });
-      }
-
       fresh.status = transition.nextState;
       fresh.cancelledAt = new Date();
       return this.requests.save(fresh);
     });
   }
 
-  private async applyManagerDecision(
-    requestId: string,
-    managerId: string,
-    event: LifecycleEvent.APPROVE | LifecycleEvent.REJECT,
-    reason: string | null = null,
-  ): Promise<TimeOffRequest> {
-    const req = await this.requests.findById(requestId);
-    if (!req) throw new NotFoundException('Request not found');
-
-    if (req.employeeId === managerId) {
-      throw new ForbiddenException(
-        'A manager cannot act on their own time-off request.',
+  /**
+   * Cancellation of a synced request. Issues a compensating HCM call
+   * (refund the days), then transitions to CANCELLED and writes a
+   * CANCELLATION_REFUND ledger row.
+   */
+  private async cancelSynced(req: TimeOffRequest): Promise<TimeOffRequest> {
+    const compensationKey = `req-${req.id}-cancel`;
+    try {
+      await this.hcm.applyDeduction({
+        employeeId: req.employeeId,
+        locationId: req.locationId,
+        delta: req.days, // positive = refund
+        idempotencyKey: compensationKey,
+      });
+    } catch (err) {
+      // Surface HCM problems to the caller; the request stays SYNCED so
+      // the user can try again. Production would also send to a retry queue.
+      this.logger.warn(
+        `Compensation failed for request ${req.id}: ${
+          err instanceof Error ? err.message : err
+        }`,
       );
+      if (err instanceof HcmBusinessError) {
+        throw new ConflictException({
+          code: 'COMPENSATION_REJECTED_BY_HCM',
+          message: 'HCM rejected the cancellation refund.',
+        });
+      }
+      throw new ConflictException({
+        code: 'COMPENSATION_FAILED',
+        message:
+          'Cancellation refund did not complete; the request is still SYNCED.',
+      });
     }
 
     const key = this.mutex.keyFor(req.employeeId, req.locationId);
     return this.mutex.runExclusive(key, async () => {
-      const fresh = await this.requests.findById(requestId);
+      const fresh = await this.requests.findById(req.id);
       if (!fresh) throw new NotFoundException('Request not found');
 
-      const transition = this.stateMachine.validate(fresh.status, event);
+      const transition = this.stateMachine.validate(
+        fresh.status,
+        LifecycleEvent.CANCEL,
+      );
       if (!transition.ok) {
         throw new ConflictException({
           code: 'INVALID_TRANSITION',
@@ -187,12 +264,101 @@ export class RequestLifecycleService {
       }
 
       fresh.status = transition.nextState;
-      fresh.managerId = managerId;
-      if (event === LifecycleEvent.REJECT) {
-        fresh.rejectionReason = reason;
-      }
-      return this.requests.save(fresh);
+      fresh.cancelledAt = new Date();
+      const saved = await this.requests.save(fresh);
+
+      await this.ledger.append({
+        employeeId: fresh.employeeId,
+        locationId: fresh.locationId,
+        delta: fresh.days,
+        eventType: LedgerEventType.CANCELLATION_REFUND,
+        requestId: fresh.id,
+        idempotencyKey: compensationKey,
+      });
+      return saved;
     });
+  }
+
+  private async syncToHcm(req: TimeOffRequest): Promise<TimeOffRequest> {
+    const key = this.mutex.keyFor(req.employeeId, req.locationId);
+
+    try {
+      await this.hcm.applyDeduction({
+        employeeId: req.employeeId,
+        locationId: req.locationId,
+        delta: -req.days,
+        idempotencyKey: req.hcmIdempotencyKey!,
+      });
+
+      // Phase 3: APPROVED_SYNCING -> SYNCED, append ledger row.
+      return this.mutex.runExclusive(key, async () => {
+        const fresh = await this.requests.findById(req.id);
+        if (!fresh) throw new NotFoundException('Request not found');
+
+        const transition = this.stateMachine.validate(
+          fresh.status,
+          LifecycleEvent.HCM_CONFIRMED,
+        );
+        if (!transition.ok) {
+          // The state moved underneath us (e.g. concurrent cancel).
+          // Don't force the transition; log for visibility.
+          this.logger.warn(
+            `Skipping HCM_CONFIRMED transition on request ${fresh.id}: ${transition.reason}`,
+          );
+          return fresh;
+        }
+
+        fresh.status = transition.nextState;
+        fresh.syncedAt = new Date();
+        const saved = await this.requests.save(fresh);
+
+        await this.ledger.append({
+          employeeId: fresh.employeeId,
+          locationId: fresh.locationId,
+          delta: -fresh.days,
+          eventType: LedgerEventType.TIME_OFF_DEDUCTION,
+          requestId: fresh.id,
+          idempotencyKey: fresh.hcmIdempotencyKey,
+        });
+        return saved;
+      });
+    } catch (err) {
+      // Retries are handled internally by HcmClient; reaching this catch
+      // means the operation has terminally failed for this attempt.
+      const event = this.classifyHcmError(err);
+      const errorMessage = err instanceof Error ? err.message : String(err);
+
+      return this.mutex.runExclusive(key, async () => {
+        const fresh = await this.requests.findById(req.id);
+        if (!fresh) throw err;
+
+        const transition = this.stateMachine.validate(fresh.status, event);
+        if (!transition.ok) {
+          this.logger.warn(
+            `Skipping ${event} transition on request ${fresh.id}: ${transition.reason}`,
+          );
+          return fresh;
+        }
+
+        fresh.status = transition.nextState;
+        fresh.hcmLastError = errorMessage;
+        fresh.hcmSyncAttempts += 1;
+        return this.requests.save(fresh);
+      });
+    }
+  }
+
+  private classifyHcmError(err: unknown): LifecycleEvent {
+    if (err instanceof HcmBusinessError) {
+      return LifecycleEvent.HCM_BUSINESS_REJECTED;
+    }
+    if (err instanceof HcmTransientError || err instanceof HcmVerificationError) {
+      // After HcmClient has exhausted its internal retries, treat as terminal
+      // for this exercise. A future branch would route to SYNC_RETRY and a
+      // background sweeper would re-attempt with longer backoff.
+      return LifecycleEvent.HCM_BUSINESS_REJECTED;
+    }
+    return LifecycleEvent.HCM_BUSINESS_REJECTED;
   }
 
   private isFutureOrToday(dateString: string): boolean {
