@@ -8,6 +8,7 @@ import { HcmModule } from './hcm/hcm.module';
 import { HealthModule } from './health/health.module';
 import { LedgerModule } from './ledger/ledger.module';
 import { LifecycleModule } from './lifecycle/lifecycle.module';
+import { ReconciliationModule } from './reconciliation/reconciliation.module';
 import { RequestsModule } from './requests/requests.module';
 
 @Module({
@@ -36,6 +37,7 @@ import { RequestsModule } from './requests/requests.module';
     BalancesModule,
     HcmModule,
     LifecycleModule,
+    ReconciliationModule,
   ],
 })
 export class AppModule {}

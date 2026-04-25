@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { MoreThan, Repository } from 'typeorm';
 import {
   PENDING_HOLD_STATUSES,
   RequestStatus,
@@ -86,5 +86,26 @@ export class RequestsService {
 
   async save(row: TimeOffRequest): Promise<TimeOffRequest> {
     return this.repo.save(row);
+  }
+
+  /**
+   * Find the most-recently-synced request for a given (employee, location)
+   * whose syncedAt is later than `after`. Used by the reconciliation grace
+   * window to avoid clobbering an in-flight sync that the batch missed.
+   */
+  async findSyncedAfter(
+    employeeId: string,
+    locationId: string,
+    after: Date,
+  ): Promise<TimeOffRequest | null> {
+    return this.repo.findOne({
+      where: {
+        employeeId,
+        locationId,
+        status: RequestStatus.SYNCED,
+        syncedAt: MoreThan(after),
+      },
+      order: { syncedAt: 'DESC' },
+    });
   }
 }
