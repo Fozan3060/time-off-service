@@ -4,6 +4,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { BalancesModule } from './balances/balances.module';
 import { ConcurrencyModule } from './concurrency/concurrency.module';
 import configuration from './config/configuration';
+import { HcmModule } from './hcm/hcm.module';
 import { HealthModule } from './health/health.module';
 import { LedgerModule } from './ledger/ledger.module';
 import { LifecycleModule } from './lifecycle/lifecycle.module';
@@ -33,6 +34,7 @@ import { RequestsModule } from './requests/requests.module';
     LedgerModule,
     RequestsModule,
     BalancesModule,
+    HcmModule,
     LifecycleModule,
   ],
 })
